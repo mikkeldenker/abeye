@@ -24,20 +24,9 @@ pub fn generate_ts(db: &dyn crate::Db, api: InputApi) -> String {
         .paths
         .paths
         .iter()
-        // .filter_map(|(path, item)| {
-        //     if item.parameters.is_none() || item.parameters.as_ref().unwrap().is_empty() {
-        //         dbg!(item.parameters.is_some());
-        //         return None;
-        //     }
-        //     Some((path, item))
-        // })
         .flat_map(|(path, item)| {
             let span = tracing::debug_span!("endpoint", path);
             let _enter = span.enter();
-
-            // if item.parameters.is_none() || item.parameters.as_ref().unwrap().is_empty() {
-            //     unreachable!()
-            // }
 
             let gen_op = |method: &'static str, op: &Option<oapi::path::Operation>| {
                 op.as_ref()
