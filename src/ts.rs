@@ -4,7 +4,7 @@ use camino::Utf8PathBuf;
 use heck::{ToLowerCamelCase, ToShoutySnakeCase};
 use indent_write::indentable::Indentable;
 use itertools::Itertools;
-use openapiv3 as oapi;
+use utoipa::openapi as oapi;
 
 use crate::{
     operation, schema_by_name, schema_ty, simplify_ty, InputApi, Operation, Property, RequestKind,
@@ -24,33 +24,37 @@ pub fn generate_ts(db: &dyn crate::Db, api: InputApi) -> String {
         .paths
         .paths
         .iter()
-        .flat_map(|(path, item)| match item {
-            oapi::ReferenceOr::Reference { reference: _ } => todo!(),
-            oapi::ReferenceOr::Item(path_item) => {
-                let span = tracing::debug_span!("endpoint", path);
-                let _enter = span.enter();
+        // .filter_map(|(path, item)| {
+        //     if item.parameters.is_none() || item.parameters.as_ref().unwrap().is_empty() {
+        //         dbg!(item.parameters.is_some());
+        //         return None;
+        //     }
+        //     Some((path, item))
+        // })
+        .flat_map(|(path, item)| {
+            let span = tracing::debug_span!("endpoint", path);
+            let _enter = span.enter();
 
-                if !path_item.parameters.is_empty() {
-                    todo!()
-                }
+            // if item.parameters.is_none() || item.parameters.as_ref().unwrap().is_empty() {
+            //     unreachable!()
+            // }
 
-                let gen_op = |method: &'static str, op: &Option<oapi::Operation>| {
-                    op.as_ref()
-                        .map(|op| (method, operation(db, api, path.clone(), op)))
-                };
-                [
-                    gen_op("DELETE", &path_item.delete),
-                    gen_op("GET", &path_item.get),
-                    gen_op("PUT", &path_item.put),
-                    gen_op("POST", &path_item.post),
-                    gen_op("HEAD", &path_item.head),
-                    gen_op("TRACE", &path_item.trace),
-                    gen_op("PATCH", &path_item.patch),
-                ]
-                .into_iter()
-                .flatten()
-                .map(|(method, op)| op.ts(db, api, method))
-            }
+            let gen_op = |method: &'static str, op: &Option<oapi::path::Operation>| {
+                op.as_ref()
+                    .map(|op| (method, operation(db, api, path.clone(), op)))
+            };
+            [
+                gen_op("DELETE", &item.delete),
+                gen_op("GET", &item.get),
+                gen_op("PUT", &item.put),
+                gen_op("POST", &item.post),
+                gen_op("HEAD", &item.head),
+                gen_op("TRACE", &item.trace),
+                gen_op("PATCH", &item.patch),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(method, op)| op.ts(db, api, method))
         })
         .collect_vec();
 
@@ -142,6 +146,7 @@ impl Type {
             TypeKind::String => "string".to_string(),
             TypeKind::Boolean => "boolean".to_string(),
             TypeKind::Ident(ident) => format!("{ident:?}"),
+            TypeKind::Null => "null".to_string(),
         }
     }
 }

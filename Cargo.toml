@@ -17,7 +17,7 @@ color-eyre = "0.6.2"
 heck = "0.4.1"
 indent_write = "2.2.0"
 itertools = "0.11.0"
-openapiv3 = "1.0.3"
+utoipa = { version = "5.2.0", features = ["debug"] }
 pluralizer = "0.4.0"
 reqwest = { version = "0.11.20", features = ["blocking", "json"] }
 salsa = { git = "https://github.com/salsa-rs/salsa.git", package = "salsa-2022" }

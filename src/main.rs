@@ -4,8 +4,8 @@ use abeye::{generate_ts, Config, Database, InputApi};
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
-use openapiv3 as oapi;
 use tracing_subscriber::{filter::LevelFilter, prelude::*, EnvFilter};
+use utoipa::openapi as oapi;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -44,7 +44,7 @@ fn run() -> Result<()> {
             output,
             api_prefix,
         } => {
-            let api: oapi::OpenAPI = match source {
+            let api: oapi::OpenApi = match source {
                 Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
                     tracing::info!(url=?s, "fetching schema");
                     reqwest::blocking::get(s)?.json()?

@@ -5,10 +5,10 @@ use camino::Utf8PathBuf;
 pub use db::Database;
 pub use ts::generate_ts;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use itertools::Itertools;
-use openapiv3 as oapi;
+use utoipa::openapi as oapi;
 
 #[salsa::jar(db = Db)]
 pub struct Jar(
@@ -33,11 +33,12 @@ pub struct Config {
 #[salsa::input]
 pub struct InputApi {
     #[return_ref]
-    pub api: oapi::OpenAPI,
+    pub api: oapi::OpenApi,
     pub config: Config,
 }
 
 #[salsa::interned]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Type {
     kind: TypeKind,
 }
@@ -54,20 +55,13 @@ enum TypeKind {
     Ident(String),
     String,
     Boolean,
+    Null,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Property {
     ty: Type,
     optional: bool,
-}
-impl Property {
-    fn required(ty: Type) -> Self {
-        Property {
-            ty,
-            optional: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,11 +101,8 @@ impl Schema {
     fn from_oapi(db: &dyn crate::Db, schema: oapi::Schema) -> Schema {
         Schema::new(db, OapiSchema { schema })
     }
-    fn kind(self, db: &dyn crate::Db) -> &oapi::SchemaKind {
-        &self.schema(db).schema.schema_kind
-    }
-    fn data(self, db: &dyn crate::Db) -> &oapi::SchemaData {
-        &self.schema(db).schema.schema_data
+    fn inner(self, db: &dyn crate::Db) -> &oapi::Schema {
+        &self.schema(db).schema
     }
 }
 
@@ -138,33 +129,29 @@ impl Type {
     }
 }
 
-fn resolve_schema(
-    db: &dyn crate::Db,
-    api: InputApi,
-    schema: &oapi::ReferenceOr<oapi::Schema>,
-) -> Schema {
+fn resolve_schema(db: &dyn crate::Db, api: InputApi, schema: &oapi::RefOr<oapi::Schema>) -> Schema {
     match schema {
-        oapi::ReferenceOr::Reference { reference } => {
-            schema_by_name(db, api, reference.clone()).unwrap()
+        oapi::RefOr::Ref(reference) => {
+            schema_by_name(db, api, reference.ref_location.clone()).unwrap()
         }
-        oapi::ReferenceOr::Item(schema) => Schema::from_oapi(db, schema.clone()),
+        oapi::RefOr::T(schema) => Schema::from_oapi(db, schema.clone()),
     }
 }
 fn resolve_schema_ty(
     db: &dyn crate::Db,
     api: InputApi,
-    schema: &oapi::ReferenceOr<oapi::Schema>,
+    schema: &oapi::RefOr<oapi::Schema>,
 ) -> Type {
     schema_ty(db, api, resolve_schema(db, api, schema))
 }
 fn shallow_schema_ty(
     db: &dyn crate::Db,
     api: InputApi,
-    schema: &oapi::ReferenceOr<oapi::Schema>,
+    schema: &oapi::RefOr<oapi::Schema>,
 ) -> Type {
     match schema {
-        oapi::ReferenceOr::Reference { reference } => {
-            if let Some(name) = reference.strip_prefix("#/components/schemas/") {
+        oapi::RefOr::Ref(reference) => {
+            if let Some(name) = reference.ref_location.strip_prefix("#/components/schemas/") {
                 if name.contains('_') {
                     resolve_schema_ty(db, api, schema)
                 } else {
@@ -174,74 +161,70 @@ fn shallow_schema_ty(
                 todo!()
             }
         }
-        oapi::ReferenceOr::Item(schema) => {
-            schema_ty(db, api, Schema::from_oapi(db, schema.clone()))
-        }
+        oapi::RefOr::T(schema) => schema_ty(db, api, Schema::from_oapi(db, schema.clone())),
     }
 }
 
 fn ty_by_name(db: &dyn crate::Db, api: InputApi, name: String) -> Type {
-    shallow_schema_ty(db, api, &oapi::ReferenceOr::Reference { reference: name })
+    shallow_schema_ty(
+        db,
+        api,
+        &oapi::RefOr::Ref(oapi::schema::RefBuilder::new().ref_location(name).build()),
+    )
 }
 
 fn operation(
     db: &dyn crate::Db,
     api: InputApi,
     path: String,
-    operation: &oapi::Operation,
+    operation: &oapi::path::Operation,
 ) -> Operation {
     let mut path_params = BTreeMap::new();
     let mut query = BTreeMap::new();
 
-    for param in &operation.parameters {
-        match param {
-            oapi::ReferenceOr::Reference { .. } => todo!(),
-            oapi::ReferenceOr::Item(param) => match param {
-                oapi::Parameter::Query { parameter_data, .. } => {
-                    let ty = match &parameter_data.format {
-                        oapi::ParameterSchemaOrContent::Schema(schema) => {
-                            shallow_schema_ty(db, api, schema)
-                        }
-                        oapi::ParameterSchemaOrContent::Content(_) => todo!(),
-                    };
-
-                    query.insert(parameter_data.name.clone(), ty);
+    for param in operation.parameters.iter().flat_map(|p| p.iter()) {
+        match param.parameter_in {
+            oapi::path::ParameterIn::Query => match &param.schema {
+                Some(oapi::RefOr::Ref(_)) => todo!(),
+                Some(oapi::RefOr::T(schema)) => {
+                    let ty = shallow_schema_ty(db, api, &oapi::RefOr::T(schema.clone()));
+                    query.insert(param.name.clone(), ty);
                 }
-                oapi::Parameter::Header { .. } => todo!(),
-                oapi::Parameter::Path { parameter_data, .. } => {
-                    let ty = match &parameter_data.format {
-                        oapi::ParameterSchemaOrContent::Schema(schema) => {
-                            shallow_schema_ty(db, api, schema)
-                        }
-                        oapi::ParameterSchemaOrContent::Content(_) => todo!(),
-                    };
-
-                    path_params.insert(parameter_data.name.clone(), ty);
-                }
-                oapi::Parameter::Cookie { .. } => todo!(),
+                None => {}
             },
+            oapi::path::ParameterIn::Path => {
+                match &param.schema {
+                    Some(oapi::RefOr::Ref(_)) => todo!(),
+                    Some(oapi::RefOr::T(schema)) => {
+                        let ty = shallow_schema_ty(db, api, &oapi::RefOr::T(schema.clone()));
+                        path_params.insert(param.name.clone(), ty);
+                    }
+                    None => {}
+                };
+            }
+            oapi::path::ParameterIn::Header => todo!(),
+            oapi::path::ParameterIn::Cookie => todo!(),
         }
     }
     let body = if let Some(body) = &operation.request_body {
-        match body {
-            oapi::ReferenceOr::Reference { .. } => todo!(),
-            oapi::ReferenceOr::Item(body) => {
-                assert_eq!(body.content.len(), 1);
-
-                let (media_type, value) = body.content.iter().next().unwrap();
-                let ty = if let Some(schema) = &value.schema {
-                    let ty = simplify_ty(db, shallow_schema_ty(db, api, schema));
-                    let ts = ty.ts(db);
-                    tracing::debug!(?media_type, ty=?ts, "request");
-                    ty
-                } else {
-                    todo!()
-                };
-                match media_type.as_str() {
-                    "application/json" => Some(RequestKind::Json(ty)),
-                    _ => todo!("unhandled request media type: {media_type:?}"),
-                }
+        assert_eq!(body.content.len(), 1, "only single content type supported");
+        let (media_type, content) = body.content.iter().next().unwrap();
+        let ty = match &content.schema {
+            None => todo!(),
+            Some(oapi::RefOr::Ref(reference)) => {
+                ty_by_name(db, api, reference.ref_location.clone())
             }
+            Some(oapi::RefOr::T(schema)) => simplify_ty(
+                db,
+                shallow_schema_ty(db, api, &oapi::RefOr::T(schema.clone())),
+            ),
+        };
+
+        let ts = ty.ts(db);
+        tracing::debug!(?media_type, ty=?ts, "request");
+        match media_type.as_str() {
+            "application/json" => Some(RequestKind::Json(ty)),
+            _ => todo!("unhandled request media type: {media_type:?}"),
         }
     } else {
         None
@@ -264,8 +247,8 @@ fn operation(
 
     for (status, res) in &operation.responses.responses {
         response = match res {
-            oapi::ReferenceOr::Reference { .. } => todo!(),
-            oapi::ReferenceOr::Item(response) => {
+            oapi::RefOr::Ref(_) => todo!(),
+            oapi::RefOr::T(response) => {
                 for (media_type, value) in &response.content {
                     if let Some(schema) = &value.schema {
                         let ty = simplify_ty(db, shallow_schema_ty(db, api, schema)).ts(db);
@@ -314,120 +297,125 @@ fn schema_by_name(db: &dyn crate::Db, api: InputApi, name: String) -> Option<Sch
         schema_by_name(db, api, name.to_string())
     } else {
         match api.api(db).components.as_ref()?.schemas.get(&name)? {
-            oapi::ReferenceOr::Reference { reference } => {
-                todo!("reference to: {reference}")
+            oapi::RefOr::Ref(reference) => {
+                todo!("reference to: {reference:?}")
             }
-            oapi::ReferenceOr::Item(schema) => Some(Schema::from_oapi(db, schema.clone())),
+            oapi::RefOr::T(schema) => Some(Schema::from_oapi(db, schema.clone())),
+        }
+    }
+}
+
+fn ty_ty(db: &dyn crate::Db, api: InputApi, ty: &oapi::Type, obj: &oapi::Object) -> Type {
+    match ty {
+        oapi::schema::Type::String => match &obj.enum_values {
+            None => Type::new(db, TypeKind::String),
+            Some(str) if str.is_empty() => Type::new(db, TypeKind::String),
+            Some(str) => Type::new(
+                db,
+                TypeKind::Or(
+                    str.iter()
+                        .map(|e| match e {
+                            serde_json::Value::String(s) => {
+                                Type::new(db, TypeKind::Ident(s.clone()))
+                            }
+                            _ => unreachable!(),
+                        })
+                        .collect(),
+                ),
+            ),
+        },
+
+        oapi::schema::Type::Array => todo!(),
+
+        oapi::Type::Null => Type::new(db, TypeKind::Null),
+
+        oapi::Type::Number | oapi::Type::Integer => Type::new(db, TypeKind::Number),
+
+        oapi::Type::Boolean => Type::new(db, TypeKind::Boolean),
+
+        oapi::Type::Object => {
+            let mut properties = BTreeMap::default();
+            let required_fields = obj.required.clone();
+
+            for (name, prop) in &obj.properties {
+                let ty = shallow_schema_ty(db, api, &prop.clone());
+                let required = required_fields.contains(&name.clone());
+                properties.insert(
+                    name.clone(),
+                    Property {
+                        ty,
+                        optional: !required,
+                    },
+                );
+            }
+
+            Type::new(db, TypeKind::Object(properties))
         }
     }
 }
 
 #[salsa::tracked]
 fn schema_ty(db: &dyn crate::Db, api: InputApi, schema: Schema) -> Type {
-    match schema.kind(db) {
-        oapi::SchemaKind::Type(ty) => match ty {
-            oapi::Type::String(str) => {
-                if str.enumeration.is_empty() {
-                    Type::new(db, TypeKind::String)
+    match schema.inner(db) {
+        oapi::Schema::Object(obj) => match &obj.schema_type {
+            oapi::schema::SchemaType::Type(ty) => ty_ty(db, api, ty, &obj),
+            oapi::schema::SchemaType::Array(array_ty) => {
+                let types: HashSet<_> =
+                    array_ty.iter().map(|ty| ty_ty(db, api, ty, &obj)).collect();
+
+                if types.len() == 1 {
+                    let ty = array_ty.first().unwrap();
+                    Type::new(db, TypeKind::Array(ty_ty(db, api, ty, &obj)))
+                } else if types.len() == 2 && types.contains(&Type::new(db, TypeKind::Null)) {
+                    let non_null = types
+                        .iter()
+                        .find(|ty| !matches!(ty.kind(db), TypeKind::Null))
+                        .unwrap();
+                    simplify_ty(db, non_null.clone())
                 } else {
-                    Type::new(
-                        db,
-                        TypeKind::Or(
-                            str.enumeration
-                                .iter()
-                                .map(|e| Type::new(db, TypeKind::Ident(e.clone().unwrap())))
-                                .collect(),
-                        ),
-                    )
+                    Type::new(db, TypeKind::Tuple(types.into_iter().collect()))
                 }
             }
 
-            oapi::Type::Number(_) | oapi::Type::Integer(_) => Type::new(db, TypeKind::Number),
-            oapi::Type::Object(obj) => {
-                let mut properties = BTreeMap::default();
-
-                for (name, prop) in &obj.properties {
-                    let ty = shallow_schema_ty(db, api, &prop.clone().unbox());
-                    let required = obj.required.contains(name);
-                    properties.insert(
-                        name.clone(),
-                        Property {
-                            ty,
-                            optional: !required,
-                        },
-                    );
-                }
-
-                if let Some(disc) = &schema.data(db).discriminator {
-                    assert!(disc.extensions.is_empty());
-
-                    match disc.mapping.len() {
-                        0 => todo!(),
-                        1 => todo!(),
-                        _ => Type::new(
-                            db,
-                            TypeKind::Or(
-                                disc.mapping
-                                    .iter()
-                                    .map(|(name, rest)| {
-                                        let ty = ty_by_name(db, api, rest.clone());
-                                        let marker = Type::new(
-                                            db,
-                                            TypeKind::Object(
-                                                [(
-                                                    disc.property_name.clone(),
-                                                    Property::required(Type::new(
-                                                        db,
-                                                        TypeKind::Ident(name.clone()),
-                                                    )),
-                                                )]
-                                                .into_iter()
-                                                .collect(),
-                                            ),
-                                        );
-                                        Type::new(db, TypeKind::And(vec![marker, ty]))
-                                    })
-                                    .collect(),
-                            ),
-                        ),
-                    }
-                } else {
-                    Type::new(db, TypeKind::Object(properties))
-                }
-            }
-            oapi::Type::Array(array_ty) => {
-                let ty = shallow_schema_ty(db, api, &array_ty.items.clone().unwrap().unbox());
-                match (array_ty.min_items, array_ty.max_items) {
-                    (Some(min), Some(max)) if min == max => {
-                        Type::new(db, TypeKind::Tuple(vec![ty; min]))
-                    }
-                    (None, None) => Type::new(db, TypeKind::Array(ty)),
-                    (min, max) => todo!("{:?}", (min, max)),
-                }
-            }
-            oapi::Type::Boolean {} => Type::new(db, TypeKind::Boolean),
+            oapi::schema::SchemaType::AnyValue => todo!(),
         },
-        oapi::SchemaKind::OneOf { one_of } => Type::new(
+        oapi::Schema::OneOf(one_of) => Type::new(
             db,
             TypeKind::Or(
                 one_of
+                    .items
                     .iter()
                     .map(|item| shallow_schema_ty(db, api, item))
                     .collect(),
             ),
         ),
-        oapi::SchemaKind::AllOf { all_of } => Type::new(
+        oapi::Schema::AllOf(all_of) => Type::new(
             db,
             TypeKind::And(
                 all_of
+                    .items
                     .iter()
                     .map(|item| shallow_schema_ty(db, api, item))
                     .collect(),
             ),
         ),
-        oapi::SchemaKind::AnyOf { .. } => todo!(),
-        oapi::SchemaKind::Not { .. } => todo!(),
-        oapi::SchemaKind::Any(_) => todo!(),
+        oapi::Schema::Array(array) => match &array.items {
+            oapi::schema::ArrayItems::RefOrSchema(ref_or) => {
+                Type::new(db, TypeKind::Array(shallow_schema_ty(db, api, &ref_or)))
+            }
+            oapi::schema::ArrayItems::False => Type::new(
+                db,
+                TypeKind::Tuple(
+                    array
+                        .prefix_items
+                        .iter()
+                        .map(|item| shallow_schema_ty(db, api, &oapi::RefOr::T(item.clone())))
+                        .collect(),
+                ),
+            ),
+        },
+        oapi::Schema::AnyOf { .. } => todo!(),
+        _ => todo!(),
     }
 }
 
@@ -504,6 +492,10 @@ fn simplify_ty(db: &dyn crate::Db, ty: Type) -> Type {
                 Type::new(db, TypeKind::And(options))
             }
         }
-        TypeKind::Number | TypeKind::String | TypeKind::Boolean | TypeKind::Ident(_) => ty,
+        TypeKind::Number
+        | TypeKind::String
+        | TypeKind::Boolean
+        | TypeKind::Ident(_)
+        | TypeKind::Null => ty,
     }
 }
